@@ -49,6 +49,7 @@
 .Op Fl m Ar node
 .Op Fl h
 .Op Fl V
+.Op Fl u
 .Op Fl o Ar option ...
 .Ar special node
 .Op Ar fuse_daemon ...
@@ -132,6 +133,13 @@ Mount on
 Show help.
 .It Fl V , Ic --version
 Show version information.
+.It Fl u , Ic --unmount
+Perform an unprivileged unmount.
+The path to unmount is taken from
+.Ar node
+or
+.Ar special
+if the former was not passed on command line.
 .It Fl o
 Mount options are specified via
 .Fl o .
@@ -248,6 +256,46 @@ The device name of a secondary mount is the device name of the corresponding
 primary mount, followed by a '#' character and the index of the secondary
 mount; e.g.,
 .Pa /dev/fuse0#3 .
+.Sh USER MOUNTS
+The
+.Nm
+utility has the SUID bit set to allow mounting FUSE filesystems by an unprivileged
+user.
+This is an important feature for AppImage bundles or file managers that use
+FUSE to access remote files.
+The "usermount" mode is activated automatically when
+.Nm
+is invoked by unprivileged user.
+When running in this mode, a couple of additional restrictions are imposed to
+prevent privilege escalation:
+.Bl -enum
+.It
+The filesystem is mounted
+.Cm nosuid .
+.It
+The mount point should not shadow another mount point.
+.It
+The mount point should be an empty directory that the user has write access to,
+without the
+.Xr sticky 7
+bit set.
+.It
+The filesystem could not be mounted over arbitrary file systems like "procfs" or
+"devfs", but only over those present in the allow list.
+Allowed file systems are "ext2fs", "fusefs", "msdosfs", "smbfs", "tmpfs", "ufs",
+and "zfs".
+.It
+The
+.Cm allow_other
+and
+.Cm allow_root
+options are prohibited.
+.El
+.Pp
+The "usermount" functionality is disabled if the
+.Va vfs.usermount
+.Xr sysctl 8
+is set to 1.
 .Sh SECURITY
 System administrators might want to use a custom mount policy (ie., one going
 beyond the

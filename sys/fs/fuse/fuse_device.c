@@ -178,6 +178,15 @@ fdata_dtor(void *arg)
 
 	if (fdata->mp && fdata->dataflags & FSESS_AUTO_UNMOUNT) {
 		vfs_ref(fdata->mp);
+		/* If FUSE daemon runs as an unprivileged user
+		 * ("fusermount" case) and requested auto_unmount,
+		 * and then exits abnormally, then we get here with
+		 * curthread->td_ucred->cr_uid != 0 .
+		 * This makes dounmount() to return EPERM, which is usually
+		 * a correct thing to do, but not in this specific case.
+		 * We want unmounting to happen, so let's lie about the uid.
+		 */
+		fdata->mp->mnt_cred->cr_uid = curthread->td_ucred->cr_uid;
 		dounmount(fdata->mp, MNT_FORCE, curthread);
 	}
 

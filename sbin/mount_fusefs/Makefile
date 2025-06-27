@@ -22,5 +22,8 @@ PACKAGE=runtime
 PROG=	mount_fusefs
 MAN=	mount_fusefs.8
 LIBADD=	util
+# this program is suid to support the mount-as-user functionality in libfuse
+BINOWN=	root
+BINMODE=4555
 
 .include <bsd.prog.mk>

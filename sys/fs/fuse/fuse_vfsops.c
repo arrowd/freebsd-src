@@ -299,6 +299,7 @@ fuse_vfsop_mount(struct mount *mp)
 
 	uint64_t mntopts, __mntopts;
 	uint32_t max_read;
+	uid_t user_id;
 	int linux_errnos;
 	int daemon_timeout;
 	int fd;
@@ -313,6 +314,7 @@ fuse_vfsop_mount(struct mount *mp)
 
 	subtype = NULL;
 	max_read = ~0;
+	user_id = 0;
 	linux_errnos = 0;
 	err = 0;
 	mntopts = 0;
@@ -340,6 +342,7 @@ fuse_vfsop_mount(struct mount *mp)
 	FUSE_FLAGOPT(auto_unmount, FSESS_AUTO_UNMOUNT);
 
 	(void)vfs_scanopt(opts, "max_read=", "%u", &max_read);
+	(void)vfs_scanopt(opts, "user_id=", "%u", &user_id);
 	(void)vfs_scanopt(opts, "linux_errnos", "%d", &linux_errnos);
 	if (vfs_scanopt(opts, "timeout=", "%u", &daemon_timeout) == 1) {
 		if (daemon_timeout < FUSE_MIN_DAEMON_TIMEOUT)
@@ -440,6 +443,8 @@ fuse_vfsop_mount(struct mount *mp)
 	 * the FUSE server.
 	 */
 	mp->mnt_kern_flag |= MNTK_NULL_NOCACHE;
+	if (user_id != 0)
+		mp->mnt_stat.f_owner = user_id;
 	MNT_IUNLOCK(mp);
 	/* We need this here as this slot is used by getnewvnode() */
 	mp->mnt_stat.f_iosize = maxbcachebuf;
