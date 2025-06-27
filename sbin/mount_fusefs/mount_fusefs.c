@@ -89,6 +89,8 @@ static struct mntopt mopts[] = {
 	/* Linux specific options, we silently ignore them */
 	{ "fd=",                 0, 0x00, 1 },
 	{ "rootmode=",           0, 0x00, 1 },
+	/* We actually do support user_id in kernel, but the user who calls
+		mount_fusefs is not supposed to pass it */
 	{ "user_id=",            0, 0x00, 1 },
 	{ "group_id=",           0, 0x00, 1 },
 	{ "large_read",          0, 0x00, 1 },
@@ -115,6 +117,83 @@ static struct mntval mvals[] = {
 
 #define DEFAULT_MOUNT_FLAGS ALTF_PRIVATE
 
+static uid_t oldeuid;
+static gid_t oldegid;
+static int usermount;
+
+static void drop_privs(void)
+{
+	/* Drop privileges regardless of the usermount flag.
+	 * When we run as regular user, but with vfs.usermount=1, we still
+	 * want to drop privileges to end up with mount owner being the regular
+	 * user.
+	 * If we don't drop privs, the mount owner would be geteuid(), root.
+	 * This later prevents unmounting by the regular user even with
+	 * vfs.usermount=1.
+	 */
+	if (getuid() != 0) {
+		oldeuid = geteuid();
+		oldegid = getegid();
+		seteuid(getuid());
+		setegid(getgid());
+	}
+}
+
+static void restore_privs(void)
+{
+	if (usermount) {
+		seteuid(oldeuid);
+		setegid(oldegid);
+	}
+}
+
+static void check_perm(const char *mnt)
+{
+	struct stat stbuf;
+	struct statfs stfsbuf;
+	size_t i;
+
+	int mnt_fd = open(mnt, O_DIRECTORY);
+
+	if (mnt_fd < 0)
+		err(1, "failed to open mountpoint %s", mnt);
+
+	if (fchdir(mnt_fd) < 0)
+		err(1, "failed to chdir into mountpoint %s", mnt);
+
+	if (fstat(mnt_fd, &stbuf) < 0)
+		err(1, "failed to access mountpoint %s", mnt);
+
+	if ((stbuf.st_mode & S_ISVTX) && stbuf.st_uid != getuid())
+		errx(1, "mountpoint %s not owned by user", mnt);
+
+	if (access(mnt, W_OK) < 0)
+		errx(1, "no write access to mountpoint %s", mnt);
+
+	/* perms are ok, but we don't allow mounting over any FS
+	 * for security reasons */
+	if (fstatfs(mnt_fd, &stfsbuf) < 0)
+		err(1, "failed to access mountpoint %s", mnt);
+
+	const char* fs_allowlist[] = {
+		"ext2fs",
+		"fusefs",
+		"msdosfs",
+		"smbfs",
+		"tmpfs",
+		"ufs",
+		"zfs",
+	};
+
+	for (i = 0; i < sizeof(fs_allowlist)/sizeof(fs_allowlist[0]); i++) {
+		int len = strlen(fs_allowlist[i]);
+		if (strncmp(fs_allowlist[i], stfsbuf.f_fstypename, len) == 0)
+			return;
+	}
+
+	errx(1, "mounting over filesystem type %s is forbidden", stfsbuf.f_fstypename);
+}
+
 int
 main(int argc, char *argv[])
 {
@@ -122,7 +201,7 @@ main(int argc, char *argv[])
 	int mntflags, iovlen, verbose = 0;
 	char *dev = NULL, *dir = NULL, mntpath[MAXPATHLEN];
 	char *devo = NULL, *diro = NULL;
-	char ndev[128], fdstr[15];
+	char ndev[128], fdstr[15], uidstr[32];
 	int i, done = 0, reject_allow_other = 0, safe_level = 0;
 	int altflags = DEFAULT_MOUNT_FLAGS;
 	int __altflags = DEFAULT_MOUNT_FLAGS;
@@ -131,6 +210,7 @@ main(int argc, char *argv[])
 	struct mntval *mv;
 	static struct option longopts[] = {
 		{"reject-allow_other", no_argument, NULL, 'A'},
+		{"unmount", no_argument, NULL, 'u'},
 		{"safe", no_argument, NULL, 'S'},
 		{"daemon", required_argument, NULL, 'D'},
 		{"daemon_opts", required_argument, NULL, 'O'},
@@ -144,6 +224,21 @@ main(int argc, char *argv[])
 	int fd = -1, fdx;
 	char *ep;
 	char *daemon_str = NULL, *daemon_opts = NULL;
+	int do_unmount = 0;
+	int usermount_sysctl;
+	size_t usermount_sysctl_size = sizeof(usermount_sysctl);
+
+	usermount = getuid() != 0;
+
+	if (sysctlbyname("vfs.usermount", &usermount_sysctl,
+		&usermount_sysctl_size, NULL, 0) == 0) {
+		/* There is no point in usermount mode if vfs.usermount=1 */
+		if (usermount_sysctl)
+			usermount = 0;
+	}
+
+	/* Drop SUID privileges */
+	drop_privs();
 
 	/*
 	 * We want a parsing routine which is not sensitive to
@@ -231,6 +326,11 @@ main(int argc, char *argv[])
 				errx(1, "mount path specified inconsistently");
 			diro = optarg;
 			break;
+		case 'u':
+			if (!usermount)
+				errx(1, "unmount flag only makes sense for usermount");
+			do_unmount = 1;
+			break;
 		case 'v': 
 			verbose = 1;
 			break;
@@ -248,7 +348,7 @@ main(int argc, char *argv[])
 		}
 		if (done)
 			break;
-	} while ((ch = getopt_long(argc, argv, "AvVho:SD:O:s:m:", longopts, NULL)) != -1);
+	} while ((ch = getopt_long(argc, argv, "AvVuho:SD:O:s:m:", longopts, NULL)) != -1);
 
 	argc -= optind;
 	argv += optind;
@@ -276,6 +376,34 @@ main(int argc, char *argv[])
 		argc--;
 	}
 
+	if (do_unmount)
+	{
+		const char *mountpoint = dir ? dir : dev;
+		if (!mountpoint)
+			errx(1, "path to unmount specified incorrectly");
+
+		/* We should not allow an unprivileged user to unmount
+		 * whatever he wants, but only FUSE mounts owned by him.
+		 */
+		struct statfs fs_buf;
+		// TODO: do checkpath() & rmslashes() here too?
+		if (statfs(mountpoint, &fs_buf) == -1)
+			err(1, "failed to access mountpoint %s", mountpoint);
+
+		if (fs_buf.f_owner != getuid())
+			errx(1, "filesystem was mounted by someone else (%u != %u), refusing to unmount", fs_buf.f_owner, getuid());
+
+		if (strncmp(fs_buf.f_fstypename, "fusefs", 6) != 0)
+			errx(1, "refusing to unmount non-FUSE filesystem");
+
+		restore_privs();
+
+		if (unmount(mountpoint, 0) != 0)
+			err(1, "failed to unmount %s", mountpoint);
+
+		return 0;
+	}
+
 	if (! (dev && dir))
 		errx(1, "missing special and/or mountpoint");
 
@@ -291,6 +419,14 @@ main(int argc, char *argv[])
 				 * allow_other is blocked, period.
 				 */
 				errx(1, "\"allow_other\" usage is banned by respective option");
+
+			if (usermount &&
+			    strcmp(mo->m_option, "allow_other") == 0)
+				errx(1, "\"allow_other\" usage is disallowed for usermount");
+
+			if (usermount &&
+			    strcmp(mo->m_option, "allow_root") == 0)
+				errx(1, "\"allow_root\" usage is disallowed for usermount");
 
 			for (mv = mvals; mv->mv_flag; ++mv) {
 				if (mo->m_flag != mv->mv_flag)
@@ -322,9 +458,15 @@ main(int argc, char *argv[])
 	if (safe_level > 0 && (argc > 0 || daemon_str || daemon_opts))
 		errx(1, "safe mode, spawning daemon not allowed");
 
+	if (usermount && (argc > 0 || daemon_str || daemon_opts))
+		errx(1, "usermount mode, spawning daemon not allowed");
+
 	if ((argc > 0 && (daemon_str || daemon_opts)) ||
 	    (daemon_opts && ! daemon_str))
 		errx(1, "daemon specified inconsistently");
+
+	if (usermount) /* TODO: fusermount does this, why is it necessary */
+		umask(033);
 
 	/*
 	 * Resolve the mountpoint with realpath(3) and remove unnecessary
@@ -416,6 +558,30 @@ main(int argc, char *argv[])
 			}
 		}
 	}
+
+	if (usermount) {
+		/* Allowing an unprivileged user to mount wherever he likes to
+		 * is a security issue. To make it safe, we perform checks
+		 * as described in
+		 * https://github.com/libfuse/libfuse/blob/22d0fcd4c757a86377bc258296e55e2900af2c3c/doc/kernel.txt#L175
+		 * The code of the check_perm() function follows the same
+		 * function from Linux fusermount:
+		 * https://github.com/libfuse/libfuse/blob/22d0fcd4c757a86377bc258296e55e2900af2c3c/util/fusermount.c#L1094
+		 */
+		check_perm(mntpath);
+		mntflags |= MNT_NOSUID;
+		mntflags |= MNT_NOCOVER;
+		mntflags |= MNT_EMPTYDIR;
+		/* To allow for later unmounting by the same unprivileged user
+		 * we pass the UID to the kernel, which ends up being saved in
+		 * mp->mnt_stat.f_owner
+		 * We later use this value in the do_unmount block.
+		 */
+		sprintf(uidstr, "%u", getuid());
+		build_iovec(&iov, &iovlen, "user_id=", uidstr, -1);
+	}
+
+	restore_privs();
 
 	/* Prepare the options vector for nmount(). build_iovec() is declared
 	 * in mntopts.h. */
